@@ -1,64 +1,64 @@
 # gomemlimit-webhook
 
-Lightweight Kubernetes Mutating Admission Webhook that automatically calculates and injects `GOMEMLIMIT` and `GOGC` environment variables into container specifications based on their memory limits.
+Kubernetes Pod のメモリ制限（`resources.limits.memory`）に基づき、Go アプリケーション向けに `GOMEMLIMIT` および `GOGC` 環境変数を動的に計算・注入する軽量な Mutating Admission Webhook です。
 
-Built with **zero heavy framework dependencies** (pure Go `net/http` and official `k8s.io/api` types) to achieve minimal footprint (~9.8MB static binary) and fast cold start.
-
----
-
-## Background & Problem
-
-In Kubernetes environments, Go applications often risk being killed by the Linux kernel OOM Killer (`SIGKILL`, Exit Code 137) because the Go runtime GC is not automatically aware of container cgroups limits.
-
-Go 1.19+ introduced the `GOMEMLIMIT` soft memory limit (`runtime/debug.SetMemoryLimit`). Setting `GOMEMLIMIT` to **85% - 90%** of the container's `resources.limits.memory` allows the Go GC to run aggressively before hitting the container limit, preventing OOM kills.
-
-While applications can import in-process libraries (like `go.uber.org/automemlimit`), cluster operators running heterogeneous or third-party containers need an infrastructure-level mechanism to enforce this policy automatically.
+`controller-runtime` などの巨大フレームワークに依存せず、**Go 標準ライブラリ (`net/http`) と Kubernetes 公式 API 型 (`k8s.io/api`) のみ** で構築されており、極小のフットプリント（静的バイナリ 約 9.8MB）と数十ミリ秒未満の高速コールドスタートを実現しています。
 
 ---
 
-## Features
+## 背景と解決する課題
 
-- **Pure Go & Minimal Dependencies**: Uses Go standard library (`net/http`) and official Kubernetes API definitions (`k8s.io/api/admission/v1`). No `controller-runtime` bloat.
-- **Micro Footprint**: ~9.8 MB static binary stripped of DWARF symbols, packaged in a Distroless non-root image.
-- **In-Memory TLS Support**: Built-in self-signed CA & server certificate generation for zero-dependency bootstrapping, alongside standard Secret mount support.
-- **RFC 6902 Compliant**: Generates precise JSON Patches for container `env` fields.
-- **Configurable**: Supports per-pod ratio customization and custom `GOGC` values via annotations.
+Kubernetes 環境では、Go のランタイム GC がコンテナの cgroup メモリ制限を自動認識しないため、一時的なヒープ伸張によってコンテナ上限を超過し、Linux カーネルの OOM Killer（`SIGKILL`, Exit Code 137）で強制終了されるリスクが常に存在します。
+
+Go 1.19 以降で導入されたソフトメモリリミット機能（`GOMEMLIMIT`）をコンテナ制限の **85%〜90%** に設定することで、上限到達前に GC を積極的に走らせて OOM 回避が可能です。
+
+自社コードを変更できる場合は `go.uber.org/automemlimit` 等をインポートするのが手軽ですが、外部 OSS やサードパーティ製コンテナなど、アプリケーションコードに手を入れられない環境において、インフラ層から透過的に自動注入する仕組みとして本 Webhook を利用できます。
 
 ---
 
-## Annotations
+## 主な特徴
 
-| Annotation | Type / Default | Description |
+- **外部フレームワーク依存ゼロ**: Go 標準ライブラリ (`net/http`) と公式型定義のみで実装。内部プロトコル（AdmissionReview v1, RFC 6902 JSON Patch）のブラックボックス化を排除。
+- **極小バイナリ・低リソース消費**: シンボルや DWARF を削ぎ落とした静的バイナリは約 9.8MB。Google Distroless (`nonroot`) イメージで安全に動作。
+- **インメモリ TLS 自己署名対応**: 外部の `cert-manager` を導入しなくても、起動時にメモリ上で CA および SAN 対応サーバー証明書を動的生成可能。もちろん Secret マウントによる証明書管理にも対応。
+- **RFC 6902 準拠の JSON Patch**: コンテナの `env` フィールドに対して正確なパッチを生成。
+- **柔軟なアノテーション設定**: Pod ごとの有効化、比率（デフォルト 90%）、追加の `GOGC` 指定に対応。
+
+---
+
+## アノテーション仕様
+
+| アノテーション | 型 / デフォルト値 | 説明 |
 | :--- | :--- | :--- |
-| `gomemlimit.aooba.net/inject` | `string` (`"true"` / `"false"`) | Opt-in webhook injection for the Pod |
-| `gomemlimit.aooba.net/ratio` | `string` (`"0.90"`) | Ratio of memory limit to allocate to `GOMEMLIMIT` (e.g., `0.85`) |
-| `gomemlimit.aooba.net/gogc` | `string` (Optional) | Custom `GOGC` target value to inject (e.g., `100`, `off`) |
+| `gomemlimit.aooba.net/inject` | `string` (`"true"` / `"false"`) | Webhook による自動注入を有効化するかどうか |
+| `gomemlimit.aooba.net/ratio` | `string` (`"0.90"`) | メモリ制限に対して割り当てる比率（例: `"0.85"`） |
+| `gomemlimit.aooba.net/gogc` | `string` (未指定) | 併せて設定したい `GOGC` の目標値（例: `"100"`, `"off"`） |
 
 ---
 
-## Quick Start
+## クイックスタート
 
-### 1. Build and Test
+### 1. ビルドとテスト
 
 ```bash
-# Run unit & integration tests with race detector
+# レースディテクター付きで単体・結合テストを実行
 make test
 
-# Build optimized static binary
+# 最適化された静的バイナリのビルド (約 9.8MB)
 make build-stripped
 ```
 
-### 2. Deploy to Kubernetes
+### 2. Kubernetes クラスタへのデプロイ
 
-Deploy the webhook and its self-signed TLS certificates to your cluster:
+TLS 証明書（Secret）の生成から Webhook Configuration への CA Bundle 注入までをワンライナーで実行します。
 
 ```bash
 ./scripts/deploy-local.sh
 ```
 
-### 3. Verification
+### 3. 動作確認
 
-Apply a sample pod with memory limits:
+メモリ制限を設定したサンプルのテスト Pod を作成します。
 
 ```yaml
 apiVersion: v1
@@ -78,23 +78,23 @@ spec:
           memory: "256Mi"
 ```
 
-Inspect the injected environment variable:
+注入された環境変数を確認します。
 
 ```bash
 kubectl get pod sample-go-app -o jsonpath='{.spec.containers[0].env}'
-# Result: [{"name":"GOMEMLIMIT","value":"217MiB"}]
+# 実行結果例: [{"name":"GOMEMLIMIT","value":"217MiB"}]
 ```
 
 ---
 
-## References
+## 参考文献
 
-- [Go GC Guide (Official Documentation)](https://go.dev/doc/gc-guide)
-- [Dynamic Admission Control (Kubernetes Official Documentation)](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/)
+- [Go GC ガイド (Go 公式ドキュメント)](https://go.dev/doc/gc-guide)
+- [Dynamic Admission Control (Kubernetes 公式ドキュメント)](https://kubernetes.io/docs/reference/access-authn-authz/extensible-admission-controllers/)
 - [RFC 6902 JavaScript Object Notation (JSON) Patch](https://datatracker.ietf.org/doc/html/rfc6902)
 
 ---
 
-## License
+## ライセンス
 
-MIT License. See [LICENSE](LICENSE) for details.
+MIT License
